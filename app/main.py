@@ -65,7 +65,6 @@ async def ip_allowlist_middleware(request: Request, call_next):
         chain = [ip.strip() for ip in xff.split(",") if ip.strip()]
         candidate_ip = chain[0] if chain else (request.client.host if request.client else "")
         if candidate_ip not in ALLOWED_PROXY_IPS:
-            # Why: restrict to Zipchat proxies when enabled.
             return JSONResponse(status_code=403, content={"detail": "Forbidden"})
     return await call_next(request)
 
@@ -74,13 +73,12 @@ async def ip_allowlist_middleware(request: Request, call_next):
 # -----------------------------
 def require_api_key(x_api_key: Optional[str] = Header(default=None)):
     if not x_api_key or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail=None)  # spec: 401, body not required
+        raise HTTPException(status_code=401, detail=None)
 
 # -----------------------------
 # HTTP headers for Commerce7 & Wineshipping
 # -----------------------------
 def _c7_headers() -> Dict[str, str]:
-    # Why: C7 requires Basic Auth (appID:appSecret) + tenant header.
     if not (C7_APP_ID and C7_APP_SECRET and C7_TENANT):
         raise RuntimeError("Missing C7_APP_ID/C7_APP_SECRET/C7_TENANT")
     token = base64.b64encode(f"{C7_APP_ID}:{C7_APP_SECRET}".encode("utf-8")).decode("utf-8")
@@ -99,7 +97,6 @@ def _ws_headers() -> Dict[str, str]:
 # Helpers
 # -----------------------------
 def _parse_order_number(order_id: str) -> Optional[int]:
-    # Accepts '40500' (strict 5 digits). Keeps '#' stripping defensive in case upstream sends it.
     s = order_id.strip()
     if s.startswith("#"):
         s = s[1:]
@@ -159,55 +156,45 @@ async def _fetch_c7_json(client: httpx.AsyncClient, path: str, params: Dict[str,
     r.raise_for_status()
     return r.json()
 
+# -- Updated lookup that uses GET /orders/{id} --
 async def fetch_c7_order_by_number_and_email(order_id: str, email: str) -> Optional[Dict[str, Any]]:
-    """Find the order by human order number, then verify the customer email via /customer/{id}."""
     order_no = _parse_order_number(order_id)
     if order_no is None:
         return None
 
     async with httpx.AsyncClient() as client:
-        data = await _fetch_c7_json(client, "/order", params={"q": str(order_no)})
-        orders = data.get("orders") or []
-        # Exact match on orderNumber (integer compare)
-        match = next((o for o in orders if str(o.get("orderNumber", "")).isdigit() and int(o["orderNumber"]) == order_no), None)
+        # Try to get a list/search result (if that endpoint exists)
+        try:
+            data = await _fetch_c7_json(client, "/orders", params={"q": str(order_no)})
+        except Exception:
+            data = None
+
+        if data:
+            orders = data.get("orders") or []
+        else:
+            orders = []
+
+        match = next((o for o in orders if str(o.get("orderNumber")).isdigit() and int(o["orderNumber"]) == order_no), None)
         if not match:
             return None
 
-        cust_id = match.get("customerId")
+        internal_id = match.get("id")
+        if internal_id is None:
+            return None
+
+        # Fetch full order by internal ID
+        full_order = await _fetch_c7_json(client, f"/orders/{internal_id}", params=None)
+
+        # Verify email
+        cust_id = full_order.get("customerId")
         if not cust_id:
             return None
-        customer = await _fetch_c7_json(client, f"/customer/{cust_id}")
+        customer = await _fetch_c7_json(client, f"/customers/{cust_id}", params=None)
         emails = [e.get("email", "").lower() for e in (customer.get("emails") or [])]
         if email.lower() not in emails:
-            # Do not leak existence on mismatch.
             return None
 
-        return match
-
-async def fetch_ws_tracking(tracking_numbers: List[str]) -> Optional[Dict[str, Any]]:
-    if not (WS_ENABLE and WS_API_KEY and tracking_numbers):
-        return None
-    url = WS_BASE_URL.rstrip("/") + "/openapi/tracking/getdetails"
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=_ws_headers(), json={"trackingNumbers": tracking_numbers}, timeout=WS_TIMEOUT_S)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        return r.json()
-
-def _status_line_from_ws(ws_payload: Dict[str, Any]) -> tuple[str, Optional[str]]:
-    try:
-        details = ws_payload.get("details") or ws_payload.get("packages") or []
-        pkg = details[0] if details else {}
-        status = pkg.get("statusDescription") or pkg.get("carrierStatus") or "in transit"
-        eta = pkg.get("estimatedDeliveryDate")
-        url = pkg.get("trackingUrl") or pkg.get("embeddedCarrierTrackingUrl")
-        line = f"Order is on its way ({status})."
-        if eta:
-            line += f" Estimated delivery {eta}."
-        return line, url
-    except Exception:
-        return "Order is on its way; follow via the provided tracking link.", None
+        return full_order
 
 # -----------------------------
 # Health
@@ -235,13 +222,12 @@ async def order_lookup(
     _: Any = Depends(require_api_key),
 ):
     if not ORDER_ID_PATTERN.match(order_id.strip()):
-        # Spec prefers 404 with context over 400 for invalid user inputs.
         return JSONResponse(status_code=404, content=NotFoundResponse(context=_context_not_found(order_id)).model_dump())
 
     try:
         c7_order = await fetch_c7_order_by_number_and_email(order_id, customer_email)
     except Exception:
-        c7_order = None  # avoid leaking upstream details
+        c7_order = None
 
     if not c7_order:
         return JSONResponse(status_code=404, content=NotFoundResponse(context=_context_not_found(order_id)).model_dump())
