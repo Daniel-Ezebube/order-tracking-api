@@ -15,7 +15,7 @@ from pydantic import BaseModel, EmailStr
 # -----------------------------
 API_KEY = os.getenv("API_KEY", "change-me")
 
-ORDER_ID_REGEX = os.getenv("ORDER_ID_REGEX", r"^\d{4,6}$")
+ORDER_ID_REGEX = os.getenv("ORDER_ID_REGEX", r"^#?[A-Za-z0-9_-]{3,20}$")
 ORDER_ID_PATTERN = re.compile(ORDER_ID_REGEX)
 
 # Toggleable IP allowlist (set ENFORCE_IP_ALLOWLIST=false to disable)
